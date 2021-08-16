@@ -1,0 +1,14 @@
+[package]
+name = "chonky"
+version = "0.1.0"
+edition = "2018"
+license = "Apache-2.0 WITH LLVM-exception"
+
+[features]
+default = ["recycling"]
+recycling = ["std"]
+std = []
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+heapless = "0.7.4"
