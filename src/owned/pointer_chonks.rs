@@ -1,37 +1,42 @@
-use crate::*;
+use super::*;
+use core::ptr::NonNull;
 
-pub const CHONK_SIZE: usize = 32;
+pub type PointerChonk<const N: usize> = ListChonk<*mut u8, N>;
 
-pub type PointerChonk = ListChonk<*mut u8, CHONK_SIZE>;
-
-pub struct PointerChonks {
+/// A list of chonks for `*mut T where T: Sized` (i.e. any non-fat pointer type).
+///
+/// Intended to be used as part of a thread-local freelist.
+///
+/// Has an additional optimisation over the regular list in that it
+/// can use the chonks themselves to store more chonks, thus making it
+/// totally allocation free so long as you keep providing chonks to
+/// it. This also means you get an extra free entry per chonk in the
+/// chonk itself.
+///
+/// ## Notes
+///
+/// * Panics if N is zero.
+/// * The best values of `N` are powers of 2 to hasten maths.
+/// * The best values of capacity are multiples of `N+1` to minimise memory waste.
+pub struct PointerChonks<const N: usize> {
     /// Start pointer
-    head: Link<PointerChonk>,
+    head: Link<PointerChonk<N>>,
     /// End pointer
-    tail: Link<PointerChonk>,
+    tail: Link<PointerChonk<N>>,
     /// All chunks, stored and internal, since they're interchangeable.
     length: usize,
     /// Maximum size we are allowed to grow to.
     capacity: usize,
 }
 
-impl Default for PointerChonks {
-    #[inline(always)]
-    fn default() -> Self { Self::with_capacity(CHONK_SIZE * (CHONK_SIZE + 1)) }
-}
-impl PointerChonks {
-
-    #[inline(always)]
-    pub fn len(&self) -> usize { self.length }
-
-    #[inline(always)]
-    pub fn capacity(&self) -> usize { self.capacity }
+impl<const N: usize> PointerChonks<N> {
 
     /// Creates a [`PointerChonks`] that will not store more than
     /// `capacity` chonks. This does not change how allocation happens
     /// at all, it merely imposes a limit on maximum length.
     #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
+        assert!(N > 0, "You may not create a zero-sized PointerChonks");
         PointerChonks {
             head: Link::default(),
             tail: Link::default(),
@@ -40,8 +45,19 @@ impl PointerChonks {
         }
     }
 
+    #[inline(always)]
+    pub fn len(&self) -> usize { self.length }
 
-    pub fn pop<T>(&mut self) -> Option<*mut ListChonk<* mut T, CHONK_SIZE>> {
+    #[inline(always)]
+    pub fn capacity(&self) -> usize { self.capacity }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool { self.length == 0}
+
+    #[inline(always)]
+    pub fn is_full(&self) -> bool { self.length == self.capacity }
+
+    pub fn pop<T>(&mut self) -> Option<*mut ListChonk<* mut T, N>> {
         if let Some(tail) = self.tail.as_mut() {
             // We are guaranteed to shrink because worst case, we can
             // give them our empty chonk.
@@ -67,26 +83,11 @@ impl PointerChonks {
         None
     }
 
-    #[inline(always)]
-    /// Casts an uninit internal chunk to an external chunk and
-    /// initialises it appropriately for use.
-    fn init<T>(ptr: *mut PointerChonk) -> *mut ListChonk<*mut T, CHONK_SIZE> {
-        // Cast to the generic pointer type. This is safe because:
-        //
-        // * `ListChonk` is `#[repr(transparent)]` and contains a `Chonk`
-        // * `Chonk` is #[repr(c)]`
-        // * All non-fat pointers are the same size.
-        let ptr = ptr.cast::<ListChonk<*mut T, CHONK_SIZE>>();
-        // Write the default value
-        unsafe { ptr.write(ListChonk::default()); }
-        ptr
-    }
-
-    /// Push a dropped (but not freed) [`PointerChonk`] onto the [`PointerChunks`]
+    /// Push a dropped (but not freed) [`PointerChonk`] onto the [`PointerChonks`]
     pub fn push<T>(
         &mut self,
-        chonk_ptr: *mut ListChonk<* mut T, CHONK_SIZE>
-    ) -> Result<(), *mut ListChonk<* mut T, CHONK_SIZE>> {
+        chonk_ptr: *mut ListChonk<* mut T, N>
+    ) -> Result<(), *mut ListChonk<* mut T, N>> {
         // Check we wouldn't go over our capacity.
         if self.length == self.capacity { return Err(chonk_ptr); }
         // No? Then we're guaranteed to grow because worst case we can
@@ -99,7 +100,7 @@ impl PointerChonks {
         //  * All non-fat pointers are the same size.
         // This is safe because it ultimately boils down to a repr(C)
         // data structure and all (non-fat) pointers are the same size.
-        let chonk_ptr: *mut PointerChonk = chonk_ptr.cast();
+        let chonk_ptr: *mut PointerChonk<N> = chonk_ptr.cast();
         if let Some(tail) = self.tail.as_mut() {
             // Try and push an item onto the tail
             if tail.0.data.push(chonk_ptr.cast()).is_err() {
@@ -118,4 +119,27 @@ impl PointerChonks {
         }
         Ok(())
     }
+
+    #[inline(always)]
+    /// Casts an uninit internal chunk to an external chunk and
+    /// initialises it appropriately for use.
+    fn init<T>(ptr: *mut PointerChonk<N>) -> *mut ListChonk<*mut T, N> {
+        // Cast to the generic pointer type. This is safe because:
+        //
+        // * `ListChonk` is `#[repr(transparent)]` and contains a `Chonk`
+        // * `Chonk` is #[repr(c)]`
+        // * All non-fat pointers are the same size.
+        let ptr = ptr.cast::<ListChonk<*mut T, N>>();
+        // Write the default value
+        unsafe { ptr.write(ListChonk::default()); }
+        ptr
+    }
+}
+
+impl<const N: usize> Default for PointerChonks<N> {
+    /// The default size is 8 * (N+1).
+    /// For N=32: 528, enough chonks to store 8448 items.
+    /// For N=16, 272, enough chonks to store 4352 items.
+    #[inline(always)]
+    fn default() -> Self { Self::with_capacity(8 * (N + 1)) }
 }
